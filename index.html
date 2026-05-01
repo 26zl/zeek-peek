@@ -1,0 +1,361 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>zeek-peek</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>
+  :root {
+    --bg: #000;
+    --bg-alt: #0c0c0c;
+    --bg-row: #111;
+    --bg-hover: #1a1a1a;
+    --border: #222;
+    --text: #d6d6d6;
+    --text-dim: #888;
+    --accent: #66d9ef;
+    --good: #6ec56e;
+    --bad: #e06666;
+    --warn: #d6b75a;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; background: var(--bg); color: var(--text); }
+  body { font: 13px -apple-system, system-ui, sans-serif; }
+  header {
+    display: flex; align-items: center; gap: 12px;
+    padding: 8px 12px; background: var(--bg-alt);
+    border-bottom: 1px solid var(--border); position: sticky; top: 0; z-index: 5;
+    flex-wrap: wrap;
+  }
+  header h1 { margin: 0; font-size: 14px; font-weight: 600; letter-spacing: 0.3px; }
+  .status { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--text-dim); }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--text-dim); }
+  .dot.ok   { background: var(--good); box-shadow: 0 0 6px var(--good); }
+  .dot.bad  { background: var(--bad);  box-shadow: 0 0 6px var(--bad); }
+  .dot.warn { background: var(--warn); box-shadow: 0 0 6px var(--warn); }
+  .spacer { flex: 1; }
+  input.filter {
+    background: var(--bg); color: var(--text);
+    border: 1px solid var(--border); padding: 4px 8px;
+    font: 12px ui-monospace, SFMono-Regular, Menlo, monospace;
+    min-width: 240px;
+  }
+  input.filter:focus { outline: 1px solid var(--accent); border-color: var(--accent); }
+  select, button {
+    background: var(--bg); color: var(--text);
+    border: 1px solid var(--border); padding: 4px 8px;
+    font: 12px -apple-system, system-ui, sans-serif; cursor: pointer;
+  }
+  button:hover, select:hover { border-color: var(--accent); color: var(--accent); }
+
+  nav.tabs {
+    display: flex; gap: 0; padding: 0 12px;
+    background: var(--bg-alt); border-bottom: 1px solid var(--border);
+    overflow-x: auto;
+  }
+  nav.tabs button {
+    background: transparent; border: none; border-bottom: 2px solid transparent;
+    color: var(--text-dim); padding: 8px 14px; font-size: 12px;
+    text-transform: uppercase; letter-spacing: 0.5px;
+  }
+  nav.tabs button.active { color: var(--accent); border-bottom-color: var(--accent); }
+  nav.tabs button.missing { color: #555; }
+
+  .meta {
+    display: flex; align-items: center; gap: 12px;
+    padding: 6px 12px; font-size: 11px; color: var(--text-dim);
+    border-bottom: 1px solid var(--border);
+  }
+
+  .table-wrap {
+    height: calc(100vh - 122px); overflow: auto;
+  }
+  table {
+    border-collapse: collapse;
+    font: 12px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    width: 100%;
+  }
+  thead th {
+    position: sticky; top: 0; z-index: 2;
+    background: #181818; color: var(--text);
+    text-align: left; padding: 4px 8px;
+    border-bottom: 1px solid var(--border); border-right: 1px solid var(--border);
+    font-weight: 600; white-space: nowrap; cursor: pointer; user-select: none;
+  }
+  thead th:hover { color: var(--accent); }
+  thead th.sorted::after { content: " ▾"; color: var(--accent); }
+  thead th.sorted.asc::after { content: " ▴"; color: var(--accent); }
+  tbody td {
+    padding: 2px 8px; border-bottom: 1px solid var(--border);
+    border-right: 1px solid var(--border);
+    white-space: nowrap; max-width: 480px; overflow: hidden; text-overflow: ellipsis;
+  }
+  tbody tr:nth-child(odd)  td { background: var(--bg); }
+  tbody tr:nth-child(even) td { background: var(--bg-row); }
+  tbody tr:hover td { background: var(--bg-hover); }
+  td.null { color: #555; font-style: italic; }
+  td.num  { text-align: right; }
+  .empty { padding: 24px; color: var(--text-dim); text-align: center; }
+</style>
+</head>
+<body>
+<header>
+  <h1>zeek-peek</h1>
+  <div class="status">
+    <span id="dot" class="dot"></span>
+    <span id="status-text">connecting…</span>
+  </div>
+  <div class="spacer"></div>
+  <input id="filter" class="filter" type="text" placeholder="filter (all columns)…" />
+  <label style="font-size:11px;color:var(--text-dim);">limit
+    <select id="limit">
+      <option>50</option><option selected>100</option>
+      <option>250</option><option>500</option><option>1000</option>
+    </select>
+  </label>
+  <label style="font-size:11px;color:var(--text-dim);">refresh
+    <select id="refresh">
+      <option value="0">off</option>
+      <option value="5">5 s</option>
+      <option value="10" selected>10 s</option>
+      <option value="30">30 s</option>
+    </select>
+  </label>
+  <button id="reload" title="Reload now">↻</button>
+</header>
+
+<nav class="tabs" id="tabs"></nav>
+<div class="meta">
+  <span id="meta-count">–</span>
+  <span class="spacer"></span>
+  <span id="meta-fetched"></span>
+</div>
+<div class="table-wrap">
+  <table id="table">
+    <thead><tr id="thead-row"></tr></thead>
+    <tbody id="tbody"></tbody>
+  </table>
+  <div id="empty" class="empty" hidden></div>
+</div>
+
+<script>
+"use strict";
+
+const TS_LOCALE = navigator.language || "en-GB";
+const TS_TIMEZONE = Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
+const TS_FORMAT = new Intl.DateTimeFormat(TS_LOCALE, {
+  timeZone: TS_TIMEZONE,
+  year: "numeric", month: "2-digit", day: "2-digit",
+  hour: "2-digit", minute: "2-digit", second: "2-digit",
+  hour12: false,
+});
+
+const state = {
+  knownLogs: [],
+  current: null,
+  available: new Set(),
+  data: { fields: [], rows: [] },
+  sort: { col: null, asc: false },
+  filter: "",
+  refreshTimer: null,
+  refreshSec: 10,
+  inflight: null,
+};
+
+function fmtTs(t) {
+  if (typeof t !== "number" || !isFinite(t)) return String(t ?? "");
+  const d = new Date(t * 1000);
+  const ms = String(Math.floor((t - Math.floor(t)) * 1000)).padStart(3, "0");
+  return TS_FORMAT.format(d) + "." + ms;
+}
+
+function isNumericField(f) {
+  return /^(ts|duration|rtt|orig_bytes|resp_bytes|missed_bytes|orig_pkts|resp_pkts|orig_ip_bytes|resp_ip_bytes|trans_id|lease_time|seen_bytes|total_bytes|status_code|request_body_len|response_body_len)$/.test(f)
+    || /(_p|_port)$/.test(f);
+}
+
+function setStatus(kind, text) {
+  document.getElementById("dot").className = "dot " + (kind || "");
+  document.getElementById("status-text").textContent = text;
+}
+
+function renderTabs() {
+  const tabs = document.getElementById("tabs");
+  tabs.innerHTML = "";
+  for (const name of state.knownLogs) {
+    const b = document.createElement("button");
+    b.textContent = name;
+    if (name === state.current) b.classList.add("active");
+    if (state.available.size && !state.available.has(name)) b.classList.add("missing");
+    b.onclick = () => { state.current = name; renderTabs(); fetchLog(); };
+    tabs.appendChild(b);
+  }
+}
+
+function applyFilterAndSort(rows) {
+  const f = state.filter.trim().toLowerCase();
+  let out = rows;
+  if (f) {
+    out = rows.filter((r) =>
+      Object.values(r).some((v) => v != null && String(v).toLowerCase().includes(f))
+    );
+  }
+  const { col, asc } = state.sort;
+  if (col) {
+    const dir = asc ? 1 : -1;
+    const numeric = isNumericField(col);
+    out = [...out].sort((a, b) => {
+      let av = a[col], bv = b[col];
+      if (av == null && bv == null) return 0;
+      if (av == null) return 1;
+      if (bv == null) return -1;
+      if (numeric) return (Number(av) - Number(bv)) * dir;
+      return String(av).localeCompare(String(bv)) * dir;
+    });
+  }
+  return out;
+}
+
+function renderTable() {
+  const fields = state.data.fields;
+  const rows = applyFilterAndSort(state.data.rows);
+
+  const headRow = document.getElementById("thead-row");
+  headRow.innerHTML = "";
+  for (const f of fields) {
+    const th = document.createElement("th");
+    th.textContent = f;
+    th.title = f;
+    if (state.sort.col === f) {
+      th.classList.add("sorted");
+      if (state.sort.asc) th.classList.add("asc");
+    }
+    th.onclick = () => {
+      if (state.sort.col === f) state.sort.asc = !state.sort.asc;
+      else { state.sort.col = f; state.sort.asc = false; }
+      renderTable();
+    };
+    headRow.appendChild(th);
+  }
+
+  const tbody = document.getElementById("tbody");
+  tbody.innerHTML = "";
+  const empty = document.getElementById("empty");
+  document.getElementById("meta-count").textContent =
+    `${rows.length} of ${state.data.rows.length} rows`;
+  if (!rows.length) {
+    empty.hidden = false;
+    empty.textContent = state.data.rows.length
+      ? "no rows match the filter"
+      : "no data";
+    return;
+  }
+  empty.hidden = true;
+
+  const frag = document.createDocumentFragment();
+  for (const r of rows) {
+    const tr = document.createElement("tr");
+    for (const f of fields) {
+      const td = document.createElement("td");
+      const v = r[f];
+      if (v == null) {
+        td.classList.add("null");
+        td.textContent = "—";
+      } else if (Array.isArray(v)) {
+        const s = v.join(", ");
+        td.textContent = s;
+        td.title = s;
+      } else if (f === "ts" && typeof v === "number") {
+        td.textContent = fmtTs(v);
+        td.title = String(v);
+      } else {
+        if (isNumericField(f)) td.classList.add("num");
+        const s = String(v);
+        td.textContent = s;
+        if (s.length > 40) td.title = s;
+      }
+      tr.appendChild(td);
+    }
+    frag.appendChild(tr);
+  }
+  tbody.appendChild(frag);
+}
+
+async function fetchStatus() {
+  try {
+    const r = await fetch("/api/status");
+    const j = await r.json();
+    if (j.ok) {
+      state.available = new Set(j.available_logs || []);
+      setStatus("ok", `${j.host} · ${j.latency_ms} ms`);
+    } else {
+      setStatus("bad", j.error || "unknown error");
+    }
+    if (Array.isArray(j.known_logs) && j.known_logs.length && state.knownLogs.length === 0) {
+      state.knownLogs = j.known_logs.slice();
+      state.current = state.knownLogs[0];
+    }
+    renderTabs();
+  } catch (e) {
+    setStatus("bad", "backend unreachable");
+  }
+}
+
+async function fetchLog() {
+  if (!state.current) return;
+  if (state.inflight) state.inflight.abort();
+  const ctrl = new AbortController();
+  state.inflight = ctrl;
+  const limit = document.getElementById("limit").value;
+  const url = `/api/log/${encodeURIComponent(state.current)}?limit=${limit}`;
+  const t0 = performance.now();
+  try {
+    const r = await fetch(url, { signal: ctrl.signal });
+    if (!r.ok) {
+      const text = await r.text();
+      throw new Error(text || `HTTP ${r.status}`);
+    }
+    const j = await r.json();
+    state.data = { fields: j.fields || [], rows: j.rows || [] };
+    renderTable();
+    document.getElementById("meta-fetched").textContent =
+      `loaded in ${Math.round(performance.now() - t0)} ms at ${new Date().toLocaleTimeString()}`;
+    if (j.missing) {
+      const empty = document.getElementById("empty");
+      empty.hidden = false;
+      empty.textContent = `${state.current}.log does not exist on the remote host`;
+    }
+  } catch (e) {
+    if (e.name === "AbortError") return;
+    setStatus("warn", "fetch error: " + e.message);
+  } finally {
+    if (state.inflight === ctrl) state.inflight = null;
+  }
+}
+
+function scheduleRefresh() {
+  if (state.refreshTimer) { clearInterval(state.refreshTimer); state.refreshTimer = null; }
+  if (state.refreshSec > 0) {
+    state.refreshTimer = setInterval(() => { fetchStatus(); fetchLog(); }, state.refreshSec * 1000);
+  }
+}
+
+document.getElementById("filter").addEventListener("input", (e) => {
+  state.filter = e.target.value;
+  renderTable();
+});
+document.getElementById("limit").addEventListener("change", fetchLog);
+document.getElementById("refresh").addEventListener("change", (e) => {
+  state.refreshSec = Number(e.target.value);
+  scheduleRefresh();
+});
+document.getElementById("reload").addEventListener("click", () => { fetchStatus(); fetchLog(); });
+
+(async () => {
+  await fetchStatus();
+  if (state.current) await fetchLog();
+  scheduleRefresh();
+})();
+</script>
+</body>
+</html>

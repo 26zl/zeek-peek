@@ -1,0 +1,36 @@
+services:
+  zeek-peek:
+    image: ghcr.io/${IMAGE_OWNER:-local}/zeek-peek:${IMAGE_TAG:-latest}
+    build: .
+    container_name: zeek-peek
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      HOST: 0.0.0.0
+      PORT: 8000
+      # Inside the container the key lives at /home/app/.ssh/id_key.
+      SSH_KEY_PATH: /home/app/.ssh/id_key
+      SSH_KNOWN_HOSTS: /home/app/.ssh/known_hosts
+      DB_PATH: /data/zeek.duckdb
+    ports:
+      - "${BIND_ADDR:-127.0.0.1}:${PORT:-8000}:8000"
+    volumes:
+      # Mount the private key read-only. The host path is configurable via .env.
+      - "${SSH_KEY_HOST_PATH:-./secrets/id_key}:/home/app/.ssh/id_key:ro"
+      - "${SSH_KNOWN_HOSTS_HOST_PATH:-./secrets/known_hosts}:/home/app/.ssh/known_hosts:ro"
+      - zeek-data:/data
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://127.0.0.1:8000/api/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  zeek-data: {}

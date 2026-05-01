@@ -1,0 +1,861 @@
+"""zeek-peek. FastAPI backend that reads Zeek logs over SSH."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import os
+import re
+import threading
+import time
+from collections.abc import Awaitable, Callable
+from contextlib import asynccontextmanager, suppress
+from pathlib import Path
+from typing import Any, TypedDict
+
+import duckdb
+import paramiko
+from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, JSONResponse, Response
+
+
+class CachedLog(TypedDict):
+    fields: list[str]
+    rows: list[dict[str, Any]]
+    size: int
+
+
+load_dotenv()
+
+
+def _env(name: str, default: str | None = None) -> str | None:
+    v = os.getenv(name)
+    return v if v not in (None, "") else default
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = _env(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except ValueError as exc:
+        raise RuntimeError(f"Invalid integer for {name}: {raw!r}") from exc
+
+
+SSH_HOST = _env("SSH_HOST")
+SSH_PORT = _env_int("SSH_PORT", 22)
+SSH_USER = _env("SSH_USER")
+SSH_KEY_PATH = os.path.expanduser(_env("SSH_KEY_PATH", "") or "")
+SSH_KEY_PASSPHRASE = _env("SSH_KEY_PASSPHRASE")
+SSH_KNOWN_HOSTS = os.path.expanduser(_env("SSH_KNOWN_HOSTS", "") or "")
+SSH_CONNECT_TIMEOUT = _env_int("SSH_CONNECT_TIMEOUT", 10)
+
+ZEEK_LOG_PATH = (_env("ZEEK_LOG_PATH", "/var/spool/zeek/zeek") or "").rstrip("/")
+
+DEFAULT_LIMIT = _env_int("DEFAULT_LIMIT", 100)
+MAX_LIMIT = _env_int("MAX_LIMIT", 10_000)
+TAIL_BYTES = _env_int("TAIL_BYTES", 524_288)
+MAX_TAIL_BYTES = _env_int("MAX_TAIL_BYTES", 8 * 1024 * 1024)
+STATUS_CACHE_TTL = float(_env("STATUS_CACHE_TTL", "5") or "5")
+LOG_CACHE_TTL = float(_env("LOG_CACHE_TTL", "2") or "2")
+MAX_CONCURRENT_SSH = _env_int("MAX_CONCURRENT_SSH", 1)
+
+ALLOWED_ORIGINS = [o.strip() for o in (_env("ALLOWED_ORIGINS", "") or "").split(",") if o.strip()]
+
+DB_PATH = _env("DB_PATH", "") or ""
+INGEST_ENABLED = (_env("INGEST_ENABLED", "true") or "").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+INGEST_INTERVAL = float(_env("INGEST_INTERVAL", "30") or "30")
+INGEST_TAIL_BYTES = _env_int("INGEST_TAIL_BYTES", 2 * 1024 * 1024)
+
+DEFAULT_KNOWN_LOGS = "conn,dns,http,ssl,ssh,dhcp,notice,files"
+KNOWN_LOGS = [
+    n.strip() for n in (_env("KNOWN_LOGS", DEFAULT_KNOWN_LOGS) or "").split(",") if n.strip()
+]
+
+# Anchored allowlist used to build remote paths, so anything outside this
+# pattern (slashes, dots, wildcards) must never reach the filesystem layer.
+LOG_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,63}$")
+
+# Zeek field names go straight into DDL via quoted identifiers. The values we
+# see in real logs are letters, digits, underscores, and dots (e.g. id.orig_h).
+# Anything outside this regex is dropped before we touch SQL: defense in depth
+# against a malicious or corrupted #fields header.
+FIELD_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.]{0,63}$")
+
+# Fields whose Zeek type is `set[...]` or `vector[...]`. Parsing the `#types`
+# header would be more correct, but Zeek emits a stable set of these names, and
+# this list is faster and lets the operator override via env if needed.
+DEFAULT_SET_FIELDS = (
+    "answers,TTLs,msg_types,tunnel_parents,uids,cert_chain_fps,"
+    "client_cert_chain_fps,proxied,orig_fuids,resp_fuids,orig_filenames,"
+    "resp_filenames,tx_hosts,rx_hosts,fuids,actions,resp_mime_types,"
+    "orig_mime_types,parents,sub,sip_proxy_status_code"
+)
+SET_FIELDS = frozenset(
+    n.strip() for n in (_env("ZEEK_SET_FIELDS", DEFAULT_SET_FIELDS) or "").split(",") if n.strip()
+)
+
+
+logger = logging.getLogger("zeek_peek")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
+
+class SSHError(Exception):
+    """Raised when an SSH operation fails. Message is safe to surface."""
+
+
+# One persistent SSH/SFTP connection is reused across requests. Reconnecting
+# per request would dominate latency on a low-end firewall like the Netgate
+# 1100. The lock serialises access; the semaphore is a future-proofing knob
+# in case we ever want to multiplex.
+_ssh_lock = threading.Lock()
+_ssh_semaphore = threading.Semaphore(max(1, MAX_CONCURRENT_SSH))
+_ssh_client: paramiko.SSHClient | None = None
+_sftp_client: paramiko.SFTPClient | None = None
+
+
+def _validate_config() -> None:
+    if not SSH_HOST:
+        raise SSHError("SSH_HOST is not set")
+    if not SSH_USER:
+        raise SSHError("SSH_USER is not set")
+
+
+def _build_client() -> paramiko.SSHClient:
+    _validate_config()
+    client = paramiko.SSHClient()
+
+    # Host key handling. Default is strict against a known_hosts file.
+    if SSH_KNOWN_HOSTS:
+        kh_path = Path(SSH_KNOWN_HOSTS)
+        if kh_path.exists():
+            client.load_host_keys(str(kh_path))
+    else:
+        with suppress(OSError):
+            client.load_system_host_keys()
+
+    client.set_missing_host_key_policy(paramiko.RejectPolicy())
+
+    pkey = None
+    if SSH_KEY_PATH:
+        key_path = Path(SSH_KEY_PATH)
+        if key_path.exists():
+            for loader in (paramiko.Ed25519Key, paramiko.ECDSAKey, paramiko.RSAKey):
+                try:
+                    pkey = loader.from_private_key_file(str(key_path), password=SSH_KEY_PASSPHRASE)
+                    break
+                except paramiko.PasswordRequiredException:
+                    break
+                except paramiko.SSHException:
+                    continue
+
+    host = SSH_HOST
+    user = SSH_USER
+    if not host or not user:
+        raise SSHError("SSH_HOST and SSH_USER are required")
+    try:
+        client.connect(
+            hostname=host,
+            port=SSH_PORT,
+            username=user,
+            pkey=pkey,
+            timeout=SSH_CONNECT_TIMEOUT,
+            banner_timeout=SSH_CONNECT_TIMEOUT,
+            auth_timeout=SSH_CONNECT_TIMEOUT,
+            allow_agent=True,
+            look_for_keys=False,
+        )
+    except paramiko.AuthenticationException as exc:
+        raise SSHError(
+            "SSH authentication failed. Load the key into ssh-agent "
+            "(`ssh-add <key>`) or set SSH_KEY_PASSPHRASE."
+        ) from exc
+    except paramiko.SSHException as exc:
+        raise SSHError(f"SSH connection failed: {exc}") from exc
+    except OSError as exc:
+        raise SSHError(f"Network error connecting to {host}: {exc}") from exc
+    return client
+
+
+def _get_clients() -> tuple[paramiko.SSHClient, paramiko.SFTPClient]:
+    """Return (ssh, sftp), reusing existing clients when alive. Caller holds _ssh_lock."""
+    global _ssh_client, _sftp_client
+    if _ssh_client is not None:
+        transport = _ssh_client.get_transport()
+        if transport is not None and transport.is_active() and _sftp_client is not None:
+            return _ssh_client, _sftp_client
+        _close_clients()
+
+    ssh = _build_client()
+    sftp = ssh.open_sftp()
+    _ssh_client = ssh
+    _sftp_client = sftp
+    return ssh, sftp
+
+
+def _close_clients() -> None:
+    global _ssh_client, _sftp_client
+    for c in (_sftp_client, _ssh_client):
+        try:
+            if c is not None:
+                c.close()
+        except Exception as exc:
+            logger.debug("Ignoring SSH client close failure: %s", exc)
+    _ssh_client = None
+    _sftp_client = None
+
+
+def _safe_remote_path(log_name: str) -> str:
+    if not LOG_NAME_RE.match(log_name):
+        raise SSHError(f"Invalid log name: {log_name!r}")
+    return f"{ZEEK_LOG_PATH}/{log_name}.log"
+
+
+def ssh_list_logs() -> list[str]:
+    """List `*.log` filenames in the Zeek log directory, via SFTP."""
+    with _ssh_semaphore, _ssh_lock:
+        try:
+            _, sftp = _get_clients()
+            names = sftp.listdir(ZEEK_LOG_PATH)
+        except SSHError:
+            raise
+        except Exception as exc:
+            _close_clients()
+            raise SSHError(f"Failed to list {ZEEK_LOG_PATH}: {exc}") from exc
+    return sorted(n[:-4] for n in names if n.endswith(".log") and not n.startswith("."))
+
+
+def ssh_fetch_log_blob(log_name: str, tail_bytes: int) -> tuple[str, str, int]:
+    """Return (header_text, body_text, file_size) for a Zeek log via SFTP only.
+
+    Reads only the last `tail_bytes` of the file when it grows past that. Zeek
+    `conn.log` and `dns.log` reach megabytes within an hour and we never need
+    the full history for the dashboard view. SFTP is used instead of running
+    `tail` over an exec channel so there is no shell on the remote host and no
+    quoting/injection concerns.
+    """
+    remote_path = _safe_remote_path(log_name)
+    tail_bytes = max(1, min(tail_bytes, MAX_TAIL_BYTES))
+    with _ssh_semaphore, _ssh_lock:
+        try:
+            _, sftp = _get_clients()
+            try:
+                st = sftp.stat(remote_path)
+            except FileNotFoundError:
+                raise
+            except OSError as exc:
+                if "No such file" in str(exc):
+                    raise FileNotFoundError(remote_path) from exc
+                raise
+            size = int(st.st_size or 0)
+            with sftp.open(remote_path, "rb") as fh:
+                fh.seek(0)
+                header_bytes = fh.read(min(4096, size))
+                if size > tail_bytes:
+                    start = size - tail_bytes
+                    fh.seek(start - 1)
+                    previous_byte = fh.read(1)
+                    fh.seek(start)
+                    body_bytes = fh.read(tail_bytes)
+                    # If the tail window starts mid-line, drop that partial row.
+                    if previous_byte != b"\n":
+                        nl = body_bytes.find(b"\n")
+                        body_bytes = body_bytes[nl + 1 :] if nl >= 0 else b""
+                else:
+                    fh.seek(0)
+                    body_bytes = fh.read(size)
+        except FileNotFoundError:
+            raise
+        except SSHError:
+            raise
+        except Exception as exc:
+            _close_clients()
+            raise SSHError(f"Failed to read {remote_path}: {exc}") from exc
+
+    header_text = header_bytes.decode("utf-8", errors="replace")
+    body_text = body_bytes.decode("utf-8", errors="replace")
+    return header_text, body_text, size
+
+
+def ssh_fetch_log_delta(log_name: str, from_offset: int) -> tuple[str, str, int]:
+    """Return (header_text, body_text, file_size) reading bytes [from_offset, size).
+
+    Used by the ingest worker. If the file shrank since `from_offset` (log
+    rotation), reads from byte 0. Unlike tail reads, deltas start at a known
+    previous file size, so the first byte is already the first unseen byte.
+    """
+    remote_path = _safe_remote_path(log_name)
+    with _ssh_semaphore, _ssh_lock:
+        try:
+            _, sftp = _get_clients()
+            try:
+                st = sftp.stat(remote_path)
+            except FileNotFoundError:
+                raise
+            except OSError as exc:
+                if "No such file" in str(exc):
+                    raise FileNotFoundError(remote_path) from exc
+                raise
+            size = int(st.st_size or 0)
+            with sftp.open(remote_path, "rb") as fh:
+                fh.seek(0)
+                header_bytes = fh.read(min(4096, size))
+                start = from_offset if 0 < from_offset <= size else 0
+                if start >= size:
+                    body_bytes = b""
+                else:
+                    fh.seek(start)
+                    body_bytes = fh.read(size - start)
+        except FileNotFoundError:
+            raise
+        except SSHError:
+            raise
+        except Exception as exc:
+            _close_clients()
+            raise SSHError(f"Failed to read {remote_path}: {exc}") from exc
+
+    return (
+        header_bytes.decode("utf-8", errors="replace"),
+        body_bytes.decode("utf-8", errors="replace"),
+        size,
+    )
+
+
+def parse_zeek(header_text: str, body_text: str) -> tuple[list[str], list[dict[str, Any]]]:
+    """Parse Zeek TSV. Returns (fields, rows).
+
+    Honors `#fields`, `#unset_field`, `#empty_field`, and `#set_separator`
+    directives from the header.
+    """
+    fields: list[str] = []
+    unset = "-"
+    empty = "(empty)"
+    set_sep = ","
+
+    for raw_line in header_text.splitlines():
+        if not raw_line.startswith("#"):
+            continue
+        parts = raw_line.split("\t")
+        key = parts[0]
+        if key == "#fields":
+            fields = parts[1:]
+        elif key == "#unset_field" and len(parts) > 1:
+            unset = parts[1]
+        elif key == "#empty_field" and len(parts) > 1:
+            empty = parts[1]
+        elif key == "#set_separator" and len(parts) > 1:
+            set_sep = parts[1]
+
+    if not fields:
+        return [], []
+
+    rows: list[dict[str, Any]] = []
+    for line in body_text.splitlines():
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split("\t")
+        if len(parts) != len(fields):
+            continue
+        row: dict[str, Any] = {}
+        for name, raw in zip(fields, parts, strict=False):
+            if raw == unset:
+                row[name] = None
+            elif raw == empty:
+                row[name] = ""
+            elif name in SET_FIELDS and raw:
+                row[name] = raw.split(set_sep)
+            else:
+                row[name] = raw
+        ts = row.get("ts")
+        if isinstance(ts, str):
+            with suppress(ValueError):
+                row["ts"] = float(ts)
+        rows.append(row)
+    return fields, rows
+
+
+# ---------- caching ----------
+
+
+# With auto-refresh on, the frontend hits `/api/status` and `/api/log/*` every
+# few seconds. Without caching this would mean an SFTP round-trip per click;
+# with a small TTL the firewall is barely touched while the UI still feels live.
+class _TTLCache:
+    """Tiny TTL cache. Thread-safe, no eviction beyond TTL."""
+
+    def __init__(self, ttl: float) -> None:
+        self._ttl = ttl
+        self._lock = threading.Lock()
+        self._data: dict[str, tuple[float, Any]] = {}
+
+    def get(self, key: str) -> Any | None:
+        if self._ttl <= 0:
+            return None
+        with self._lock:
+            entry = self._data.get(key)
+            if entry is None:
+                return None
+            expires, value = entry
+            if expires < time.time():
+                self._data.pop(key, None)
+                return None
+            return value
+
+    def set(self, key: str, value: Any) -> None:
+        if self._ttl <= 0:
+            return
+        with self._lock:
+            self._data[key] = (time.time() + self._ttl, value)
+
+
+_status_cache = _TTLCache(STATUS_CACHE_TTL)
+_log_cache = _TTLCache(LOG_CACHE_TTL)
+
+
+# DuckDB is embedded; one process holds the connection. We serialise access
+# with a lock that the ingest worker and the API both go through.
+_db_lock = threading.Lock()
+_db: duckdb.DuckDBPyConnection | None = None
+_ingest_task: asyncio.Task[None] | None = None
+
+
+def _table_name(log_name: str) -> str:
+    if not LOG_NAME_RE.match(log_name):
+        raise ValueError(f"Invalid log name: {log_name!r}")
+    # log_<name> avoids collisions with reserved words and the metadata table.
+    return f"log_{log_name}"
+
+
+def _quote_ident(name: str) -> str:
+    if not FIELD_NAME_RE.match(name):
+        raise ValueError(f"Invalid SQL identifier: {name!r}")
+    return f'"{name}"'
+
+
+def _get_db() -> duckdb.DuckDBPyConnection:
+    """Open the DuckDB connection, creating the metadata table on first use.
+
+    Lazy init runs under `_db_lock` so concurrent first-callers don't race.
+    """
+    global _db
+    if _db is not None:
+        return _db
+    with _db_lock:
+        if _db is not None:
+            return _db
+        if not DB_PATH:
+            raise RuntimeError("DB_PATH is empty; storage is disabled")
+        path = Path(DB_PATH).expanduser()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        con = duckdb.connect(str(path))
+        con.execute(
+            """
+            CREATE TABLE IF NOT EXISTS _ingest_state (
+                log_name   VARCHAR PRIMARY KEY,
+                file_size  BIGINT  NOT NULL,
+                last_ts    DOUBLE,
+                updated_at TIMESTAMP DEFAULT now()
+            )
+            """
+        )
+        _db = con
+        return _db
+
+
+def _close_db() -> None:
+    global _db
+    with _db_lock:
+        if _db is not None:
+            with suppress(Exception):
+                _db.close()
+            _db = None
+
+
+def _safe_fields(fields: list[str]) -> list[str]:
+    """Drop any field name that doesn't match the strict allowlist."""
+    return [f for f in fields if FIELD_NAME_RE.match(f)]
+
+
+def _ensure_table(con: duckdb.DuckDBPyConnection, log_name: str, fields: list[str]) -> None:
+    """Create or extend the per-log table to cover every Zeek field name.
+
+    All columns are VARCHAR except `ts` (DOUBLE). Set/vector fields are stored
+    as JSON strings to keep the schema flat and avoid per-log type discovery.
+    """
+    table = _table_name(log_name)
+    quoted_table = _quote_ident(table)
+    existing_rows = con.execute(
+        "SELECT column_name FROM information_schema.columns WHERE table_name = ?",
+        [table],
+    ).fetchall()
+    existing = {row[0] for row in existing_rows}
+
+    if not existing:
+        cols = ['"ts" DOUBLE'] + [f"{_quote_ident(f)} VARCHAR" for f in fields if f != "ts"]
+        con.execute(f"CREATE TABLE {quoted_table} ({', '.join(cols)})")
+        con.execute(
+            f'CREATE INDEX IF NOT EXISTS {_quote_ident(f"{table}_ts_idx")} ON {quoted_table}("ts")'
+        )
+        return
+
+    for f in fields:
+        if f not in existing:
+            col_type = "DOUBLE" if f == "ts" else "VARCHAR"
+            con.execute(f"ALTER TABLE {quoted_table} ADD COLUMN {_quote_ident(f)} {col_type}")
+
+
+def _row_for_db(row: dict[str, Any]) -> dict[str, Any]:
+    """Coerce a parsed Zeek row into types DuckDB can take through executemany."""
+    out: dict[str, Any] = {}
+    for k, v in row.items():
+        if v is None:
+            out[k] = None
+        elif k == "ts":
+            out[k] = v if isinstance(v, int | float) else None
+        elif isinstance(v, list):
+            out[k] = json.dumps(v)
+        else:
+            out[k] = str(v)
+    return out
+
+
+def db_ingest_one(log_name: str) -> int:
+    """Pull new rows from `<log_name>.log` into DuckDB. Returns rows inserted."""
+    if not LOG_NAME_RE.match(log_name):
+        raise ValueError(f"Invalid log name: {log_name!r}")
+
+    con = _get_db()
+    with _db_lock:
+        prior = con.execute(
+            "SELECT file_size, last_ts FROM _ingest_state WHERE log_name = ?",
+            [log_name],
+        ).fetchone()
+    last_size = int(prior[0]) if prior else 0
+    prior_last_ts = float(prior[1]) if prior and prior[1] is not None else None
+
+    if last_size == 0:
+        # First run: only ingest the recent tail to avoid hammering the firewall.
+        header, body, size = ssh_fetch_log_blob(log_name, INGEST_TAIL_BYTES)
+        from_offset = max(0, size - INGEST_TAIL_BYTES)
+        rotated = False
+    else:
+        header, body, size = ssh_fetch_log_delta(log_name, last_size)
+        from_offset = last_size if size >= last_size else 0
+        rotated = size < last_size
+
+    if size == last_size and last_size > 0:
+        return 0
+
+    fields, rows = parse_zeek(header, body)
+    fields = _safe_fields(fields)
+    if not fields:
+        return 0
+
+    # Watermark dedup: after a log rotation we may end up replaying rows we've
+    # already stored. Drop anything not strictly newer than the last seen ts.
+    if rotated and prior_last_ts is not None and rows:
+        rows = [r for r in rows if isinstance(r.get("ts"), int | float) and r["ts"] > prior_last_ts]
+
+    inserted = 0
+    with _db_lock:
+        _ensure_table(con, log_name, fields)
+        if rows:
+            cols = ", ".join(_quote_ident(f) for f in fields)
+            placeholders = ", ".join(["?"] * len(fields))
+            params = [tuple(_row_for_db(r).get(f) for f in fields) for r in rows]
+            insert_sql = f"INSERT INTO {_quote_ident(_table_name(log_name))} ({cols}) VALUES ({placeholders})"  # nosec B608
+            con.executemany(insert_sql, params)
+            inserted = len(rows)
+
+        latest_ts = max(
+            (r["ts"] for r in rows if isinstance(r.get("ts"), int | float)),
+            default=None,
+        )
+        con.execute(
+            """
+            INSERT INTO _ingest_state (log_name, file_size, last_ts, updated_at)
+            VALUES (?, ?, ?, now())
+            ON CONFLICT (log_name) DO UPDATE SET
+                file_size  = EXCLUDED.file_size,
+                last_ts    = COALESCE(EXCLUDED.last_ts, _ingest_state.last_ts),
+                updated_at = now()
+            """,
+            [log_name, size, latest_ts],
+        )
+
+    logger.info(
+        "ingest %s: +%d rows, file_size=%d (offset=%d)",
+        log_name,
+        inserted,
+        size,
+        from_offset,
+    )
+    return inserted
+
+
+def db_query_log(
+    log_name: str, limit: int, since: float | None
+) -> tuple[list[str], list[dict[str, Any]]] | None:
+    """Read rows from DuckDB. Returns None if the table doesn't exist or is empty."""
+    if not DB_PATH:
+        return None
+    if not LOG_NAME_RE.match(log_name):
+        raise ValueError(f"Invalid log name: {log_name!r}")
+    try:
+        con = _get_db()
+    except Exception:
+        return None
+    table = _table_name(log_name)
+    quoted_table = _quote_ident(table)
+    with _db_lock:
+        exists = con.execute(
+            "SELECT 1 FROM information_schema.tables WHERE table_name = ?", [table]
+        ).fetchone()
+        if not exists:
+            return None
+        cols = [
+            r[0]
+            for r in con.execute(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_name = ? ORDER BY ordinal_position",
+                [table],
+            ).fetchall()
+        ]
+        if not cols:
+            return None
+        sql = f"SELECT * FROM {quoted_table}"  # nosec B608
+        params: list[Any] = []
+        if since is not None:
+            sql += " WHERE ts >= ?"
+            params.append(since)
+        sql += " ORDER BY ts DESC LIMIT ?"
+        params.append(limit)
+        raw = con.execute(sql, params).fetchall()
+
+    if not raw:
+        return cols, []
+
+    rows: list[dict[str, Any]] = []
+    for tup in reversed(raw):  # client expects oldest first
+        d: dict[str, Any] = {}
+        for col, val in zip(cols, tup, strict=True):
+            if val is None:
+                d[col] = None
+            elif col in SET_FIELDS and isinstance(val, str) and val.startswith("["):
+                with suppress(json.JSONDecodeError):
+                    d[col] = json.loads(val)
+                    continue
+                d[col] = val
+            else:
+                d[col] = val
+        rows.append(d)
+    return cols, rows
+
+
+def _db_status() -> dict[str, Any]:
+    """Snapshot of the storage layer for /api/status."""
+    if not DB_PATH:
+        return {"enabled": False}
+    info: dict[str, Any] = {
+        "enabled": True,
+        "path": DB_PATH,
+        "ingest_enabled": INGEST_ENABLED,
+        "ingest_interval": INGEST_INTERVAL,
+    }
+    try:
+        con = _get_db()
+        with _db_lock:
+            rows = con.execute(
+                "SELECT log_name, file_size, last_ts, updated_at FROM _ingest_state"
+            ).fetchall()
+        info["state"] = [
+            {"log": r[0], "file_size": r[1], "last_ts": r[2], "updated_at": str(r[3])} for r in rows
+        ]
+    except Exception as exc:
+        info["error"] = str(exc)
+    return info
+
+
+async def _ingest_loop() -> None:
+    """Background worker that pulls deltas from each known log into DuckDB."""
+    logger.info("ingest worker starting (interval=%.0fs)", INGEST_INTERVAL)
+    while True:
+        for name in KNOWN_LOGS:
+            try:
+                await asyncio.to_thread(db_ingest_one, name)
+            except FileNotFoundError:
+                continue
+            except SSHError as exc:
+                logger.warning("ingest %s: ssh error: %s", name, exc)
+            except Exception:
+                logger.exception("ingest %s: unexpected error", name)
+        try:
+            await asyncio.sleep(INGEST_INTERVAL)
+        except asyncio.CancelledError:
+            break
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global _ingest_task
+    if INGEST_ENABLED and DB_PATH:
+        _ingest_task = asyncio.create_task(_ingest_loop())
+    yield
+    if _ingest_task is not None:
+        _ingest_task.cancel()
+        with suppress(asyncio.CancelledError, Exception):
+            await _ingest_task
+    with _ssh_lock:
+        _close_clients()
+    _close_db()
+
+
+app = FastAPI(title="zeek-peek", lifespan=lifespan)
+
+if ALLOWED_ORIGINS:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=ALLOWED_ORIGINS,
+        allow_methods=["GET"],
+        allow_headers=["*"],
+    )
+
+
+@app.middleware("http")
+async def _security_headers(  # pyright: ignore[reportUnusedFunction]
+    request: Request,
+    call_next: Callable[[Request], Awaitable[Response]],
+) -> Response:
+    response = await call_next(request)
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Referrer-Policy", "no-referrer")
+    return response
+
+
+@app.get("/api/health")
+def api_health() -> dict[str, Any]:
+    return {"ok": True}
+
+
+@app.get("/api/status")
+async def api_status() -> JSONResponse:
+    cached = _status_cache.get("status")
+    if cached is not None:
+        return JSONResponse(cached)
+
+    info: dict[str, Any] = {
+        "host": f"{SSH_USER or '?'}@{SSH_HOST or '?'}:{SSH_PORT}",
+        "log_path": ZEEK_LOG_PATH,
+        "known_logs": KNOWN_LOGS,
+        "db": _db_status(),
+    }
+    started = time.perf_counter()
+    try:
+        available = await asyncio.to_thread(ssh_list_logs)
+        info.update(
+            ok=True,
+            latency_ms=int((time.perf_counter() - started) * 1000),
+            available_logs=available,
+        )
+    except SSHError as exc:
+        info.update(ok=False, error=str(exc))
+    except Exception as exc:
+        logger.exception("Unexpected error in /api/status")
+        info.update(ok=False, error=f"Unexpected error: {exc.__class__.__name__}")
+
+    _status_cache.set("status", info)
+    return JSONResponse(info)
+
+
+@app.get("/api/log/{name}")
+async def api_log(
+    name: str,
+    limit: int = Query(default=DEFAULT_LIMIT, ge=1, le=MAX_LIMIT),
+    since: float | None = Query(default=None),
+    tail: int = Query(default=TAIL_BYTES, ge=1024, le=MAX_TAIL_BYTES),
+    source: str = Query(default="auto", pattern="^(auto|db|ssh)$"),
+) -> JSONResponse:
+    if not LOG_NAME_RE.match(name):
+        raise HTTPException(400, "Invalid log name")
+
+    # Try DuckDB first when storage is enabled; it sidesteps SFTP entirely.
+    if source in ("auto", "db") and DB_PATH:
+        try:
+            db_result = await asyncio.to_thread(db_query_log, name, limit, since)
+        except Exception:
+            logger.exception("DB query failed for %s, falling back to SSH", name)
+            db_result = None
+        if db_result is not None and (db_result[1] or source == "db"):
+            db_fields, db_rows = db_result
+            return JSONResponse(
+                {
+                    "name": name,
+                    "fields": db_fields,
+                    "rows": db_rows,
+                    "count": len(db_rows),
+                    "missing": False,
+                    "source": "db",
+                }
+            )
+
+    cache_key = f"{name}:{tail}"
+    cached: CachedLog | None = _log_cache.get(cache_key)
+    if cached is None:
+        try:
+            header, body, size = await asyncio.to_thread(ssh_fetch_log_blob, name, tail)
+        except FileNotFoundError:
+            return JSONResponse(
+                {
+                    "name": name,
+                    "fields": [],
+                    "rows": [],
+                    "missing": True,
+                    "count": 0,
+                    "source": "ssh",
+                }
+            )
+        except SSHError as exc:
+            raise HTTPException(502, str(exc)) from exc
+        except Exception as exc:
+            logger.exception("Unexpected error fetching log %s", name)
+            raise HTTPException(500, "Internal error") from exc
+
+        parsed_fields, parsed_rows = parse_zeek(header, body)
+        cached = CachedLog(fields=parsed_fields, rows=parsed_rows, size=size)
+        _log_cache.set(cache_key, cached)
+
+    fields: list[str] = cached["fields"]
+    rows: list[dict[str, Any]] = list(cached["rows"])
+
+    if since is not None:
+        rows = [r for r in rows if isinstance(r.get("ts"), int | float) and r["ts"] >= since]
+
+    if len(rows) > limit:
+        rows = rows[-limit:]
+
+    return JSONResponse(
+        {
+            "name": name,
+            "fields": fields,
+            "rows": rows,
+            "count": len(rows),
+            "missing": False,
+            "file_size": cached["size"],
+            "source": "ssh",
+        }
+    )
+
+
+@app.get("/")
+def index() -> FileResponse:
+    return FileResponse(Path(__file__).parent / "index.html")
