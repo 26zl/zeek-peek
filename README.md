@@ -69,13 +69,18 @@ To disable, set `DB_PATH=` in `.env` and the dashboard reverts to the
 SFTP-only path. The Docker setup persists the DB in a named volume
 (`zeek-data`).
 
+Run a **single process**. DuckDB allows one read-write process per file
+and the ingest worker runs in-process, so do not use `uvicorn
+--workers >1` or `gunicorn -w >1` (the extra workers would fail to open
+the database).
+
 ## Endpoints
 
 - `GET /`: frontend
 - `GET /api/health`: liveness probe
 - `GET /api/status`: SSH state, available logs, DB ingest state
-- `GET /api/log/{name}?limit=&since=&tail=&source=auto|db|ssh`: last
-  rows of `{name}.log`
+- `GET /api/log/{name}?limit=`: last rows of `{name}.log` (from DuckDB
+  when storage is enabled, else over SFTP)
 
 ## Security
 

@@ -165,7 +165,9 @@ const state = {
 function fmtTs(t) {
   if (typeof t !== "number" || !isFinite(t)) return String(t ?? "");
   const d = new Date(t * 1000);
-  const ms = String(Math.floor((t - Math.floor(t)) * 1000)).padStart(3, "0");
+  // getMilliseconds() reflects the rounded ms the Date was built from; computing
+  // it via float subtraction loses precision on large epochs and drops a ms.
+  const ms = String(d.getMilliseconds()).padStart(3, "0");
   return TS_FORMAT.format(d) + "." + ms;
 }
 
@@ -239,6 +241,8 @@ function renderTable() {
   }
 
   const tbody = document.getElementById("tbody");
+  const wrap = document.querySelector(".table-wrap");
+  const savedTop = wrap ? wrap.scrollTop : 0;
   tbody.innerHTML = "";
   const empty = document.getElementById("empty");
   document.getElementById("meta-count").textContent =
@@ -279,6 +283,8 @@ function renderTable() {
     frag.appendChild(tr);
   }
   tbody.appendChild(frag);
+  // Keep the operator's scroll position across auto-refresh rebuilds.
+  if (wrap) wrap.scrollTop = savedTop;
 }
 
 async function fetchStatus() {
@@ -312,6 +318,7 @@ async function fetchLog() {
   try {
     const r = await fetch(url, { signal: ctrl.signal });
     if (!r.ok) {
+      if (r.status === 422) throw new Error("limit exceeds server MAX_LIMIT");
       const text = await r.text();
       throw new Error(text || `HTTP ${r.status}`);
     }

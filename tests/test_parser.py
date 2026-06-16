@@ -8,7 +8,7 @@ import os
 os.environ.setdefault("SSH_HOST", "test.invalid")
 os.environ.setdefault("SSH_USER", "test")
 
-from main import parse_zeek
+from main import _safe_fields, parse_zeek
 
 HEADER = "\n".join(
     [
@@ -124,3 +124,22 @@ def test_empty_body():
     fields, rows = parse_zeek(HEADER, "")
     assert fields  # header was parsed
     assert rows == []
+
+
+def test_empty_set_field_is_list():
+    # Zeek's empty-field token on a set/vector column means "empty set", not "".
+    body = _row("1.0", "u1", "1.1.1.1", "80", "http", "(empty)")
+    _, rows = parse_zeek(HEADER, body)
+    assert rows[0]["answers"] == []
+
+
+def test_empty_set_separator_falls_back_to_comma():
+    # A corrupt/truncated `#set_separator\t` must not make split() raise.
+    bad_header = "\n".join(["#set_separator\t", "#fields\tts\tanswers"])
+    _, rows = parse_zeek(bad_header, _row("1.0", "a,b"))
+    assert rows[0]["answers"] == ["a", "b"]
+
+
+def test_safe_fields_dedupes_duplicate_names():
+    # A duplicate #fields name must not reach DDL (would crash CREATE/ALTER).
+    assert _safe_fields(["ts", "x", "x", "y"]) == ["ts", "x", "y"]

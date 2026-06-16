@@ -14,7 +14,13 @@ env:
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
+  # Gate the publish on the full CI suite (lint, types, tests, docker build) so a
+  # red CI can never ship an image. Reuses ci.yml rather than duplicating steps.
+  ci:
+    uses: ./.github/workflows/ci.yml
+
   publish:
+    needs: ci
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

@@ -70,12 +70,6 @@ def test_log_limit(client):
     assert [row["uid"] for row in j["rows"]] == ["u2", "u3"]
 
 
-def test_log_since_filter(client):
-    r = client.get("/api/log/conn?since=2.0")
-    j = r.json()
-    assert [row["uid"] for row in j["rows"]] == ["u2", "u3"]
-
-
 def test_log_invalid_name(client):
     r = client.get("/api/log/foo;bar")
     assert r.status_code == 400
@@ -113,6 +107,23 @@ def test_status_error_when_ssh_fails(client, monkeypatch):
     j = client.get("/api/status").json()
     assert j["ok"] is False
     assert "boom" in j["error"]
+
+
+def test_log_db_error_falls_back_to_ssh(client, monkeypatch):
+    # Storage enabled, but the DB query blows up: the endpoint must fall back to
+    # SFTP rather than 500.
+    monkeypatch.setattr(main, "DB_PATH", "/tmp/zeek-peek-test.duckdb")
+
+    def boom(name, limit):
+        raise RuntimeError("db locked")
+
+    monkeypatch.setattr(main, "db_query_log", boom)
+    main._log_cache._data.clear()
+    r = client.get("/api/log/conn?limit=5")
+    assert r.status_code == 200
+    j = r.json()
+    assert j["source"] == "ssh"
+    assert j["count"] == 3
 
 
 def test_log_ssh_error_returns_502(client, monkeypatch):
