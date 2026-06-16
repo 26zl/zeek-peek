@@ -1,9 +1,19 @@
 # zeek-peek
 
-Agentless Zeek log viewer for pfSense, OPNsense, and small Zeek
-sensors (Netgate, Protectli, Raspberry Pi, mini-PCs). SFTP pulls,
-DuckDB storage, browser UI. No SIEM, no Grafana, no agent on the
-device.
+[![CI](https://github.com/26zl/zeek-peek/actions/workflows/ci.yml/badge.svg)](https://github.com/26zl/zeek-peek/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/)
+[![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
+
+Zeek already watches your network; zeek-peek just makes its logs nice
+to read. Point it at the box running Zeek and it pulls the TSV logs
+over SSH, stores them in an embedded DuckDB, and serves a fast browser
+table. Nothing lands on the sensor: no agent, no SIEM, no Grafana, no
+log shipper. It just hands over log bytes via SFTP, which even a
+low-end firewall does cheaply.
+
+Built for pfSense / OPNsense and standalone Zeek on small hardware:
+Netgate, Protectli, Raspberry Pi, mini-PCs, VMs, LXC.
 
 ## Why
 
@@ -97,6 +107,13 @@ the database).
 pip install -r requirements-dev.txt
 ruff check . && ruff format --check . && mypy && pytest
 ```
+
+## Contributing
+
+This started as a personal project, but I'm glad for the company. Issues
+and pull requests are welcome, and any help is genuinely appreciated,
+especially bug reports from hardware or Zeek setups I can't test myself
+(OPNsense, JSON logs, unusual log paths).
 
 ## License
 
