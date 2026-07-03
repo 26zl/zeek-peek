@@ -1,5 +1,4 @@
-"""CORS wiring is import-time (driven by ALLOWED_ORIGINS), so reload main with
-it set. Isolated in its own module to keep the reload from leaking into others."""
+"""CORS is wired at import time from ALLOWED_ORIGINS; reload main with it set."""
 
 from __future__ import annotations
 

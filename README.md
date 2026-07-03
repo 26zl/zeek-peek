@@ -75,6 +75,12 @@ from each log on `INGEST_INTERVAL` (default 30 s) and inserts them into
 `log_<name>` tables. The API queries DuckDB and falls back to SFTP only
 when a table is empty (cold start).
 
+Each table is capped at `RETENTION_ROWS` (default 500 000); older rows are
+pruned on every ingest tick, so the DuckDB file stabilises in size rather than
+growing forever. Set `RETENTION_ROWS=0` to keep everything. DuckDB reuses freed
+space on later writes, so the file stops growing at steady state but does not
+shrink on its own.
+
 To disable, set `DB_PATH=` in `.env` and the dashboard reverts to the
 SFTP-only path. The Docker setup persists the DB in a named volume
 (`zeek-data`).

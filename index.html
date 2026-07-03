@@ -165,15 +165,13 @@ const state = {
 function fmtTs(t) {
   if (typeof t !== "number" || !isFinite(t)) return String(t ?? "");
   const d = new Date(t * 1000);
-  // getMilliseconds() reflects the rounded ms the Date was built from; computing
-  // it via float subtraction loses precision on large epochs and drops a ms.
   const ms = String(d.getMilliseconds()).padStart(3, "0");
   return TS_FORMAT.format(d) + "." + ms;
 }
 
 function isNumericField(f) {
   return /^(ts|duration|rtt|orig_bytes|resp_bytes|missed_bytes|orig_pkts|resp_pkts|orig_ip_bytes|resp_ip_bytes|trans_id|lease_time|seen_bytes|total_bytes|status_code|request_body_len|response_body_len)$/.test(f)
-    || /(_p|_port)$/.test(f);
+    || /(\.(orig|resp)_p|_port)$/.test(f);
 }
 
 function setStatus(kind, text) {

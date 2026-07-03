@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import os
 
+import pytest
+
 # The module reads env at import time. Provide harmless defaults.
 os.environ.setdefault("SSH_HOST", "test.invalid")
 os.environ.setdefault("SSH_USER", "test")
 
-from main import _safe_fields, parse_zeek
+from main import _quote_ident, _safe_fields, parse_zeek
 
 HEADER = "\n".join(
     [
@@ -143,3 +145,12 @@ def test_empty_set_separator_falls_back_to_comma():
 def test_safe_fields_dedupes_duplicate_names():
     # A duplicate #fields name must not reach DDL (would crash CREATE/ALTER).
     assert _safe_fields(["ts", "x", "x", "y"]) == ["ts", "x", "y"]
+
+
+def test_safe_fields_drops_invalid_identifiers():
+    assert _safe_fields(["ts", "bad;name", "a b", "x'y", "id.orig_h"]) == ["ts", "id.orig_h"]
+
+
+def test_quote_ident_rejects_injection():
+    with pytest.raises(ValueError):
+        _quote_ident("x; DROP TABLE users")

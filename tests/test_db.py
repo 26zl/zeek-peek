@@ -129,6 +129,16 @@ def test_missing_table_returns_none(db_main):
     assert db_main.db_query_log("never_ingested", limit=10) is None
 
 
+def test_retention_caps_rows_per_table(db_main, monkeypatch):
+    monkeypatch.setattr(db_main, "RETENTION_ROWS", 2)
+    body = "1.0\tu1\thttp\t-\n2.0\tu2\tssl\t-\n3.0\tu3\tdns\t-\n"
+    monkeypatch.setattr(db_main, "ssh_fetch_log_blob", lambda n, t: _fake_log_blob(body))
+    db_main.db_ingest_one("conn")
+
+    _, rows = db_main.db_query_log("conn", limit=10)
+    assert [r["uid"] for r in rows] == ["u2", "u3"]  # oldest row (u1) pruned
+
+
 def _hdr(open_ts: str) -> str:
     return "\n".join(
         [
@@ -148,9 +158,7 @@ def test_rotation_detected_when_new_file_outgrows_old(db_main, monkeypatch):
     monkeypatch.setattr(db_main, "ssh_fetch_log_blob", lambda n, t: (_hdr("A"), body1, len(body1)))
     assert db_main.db_ingest_one("conn") == 2
 
-    # Rotated file (#open B) that has ALREADY grown past the old size between polls.
-    # Size-only detection would read mid-file and lose the leading rows; identity
-    # (the changed #open) must trigger a full re-read from byte 0.
+    # Rotated file (#open B) that already outgrew the old size between polls.
     new_full = "3.0\tu3\tdns\t-\n4.0\tu4\thttp\t-\n5.0\tu5\tssl\t-\n6.0\tu6\tdns\t-\n"
     assert len(new_full) > len(body1)
 

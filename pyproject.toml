@@ -17,3 +17,10 @@ files = ["main.py"]
 addopts = "-q"
 testpaths = ["tests"]
 filterwarnings = ["ignore::DeprecationWarning"]
+
+# Make Pylance/Pyright match CI: target 3.11 and resolve imports from the local
+# .venv (create it with `python3 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt`).
+[tool.pyright]
+venvPath = "."
+venv = ".venv"
+pythonVersion = "3.11"

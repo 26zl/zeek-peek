@@ -28,9 +28,7 @@ class CachedLog(TypedDict):
 
 
 def _load_env_file(path: str = ".env") -> None:
-    """Load KEY=value lines from a .env file for local dev (in Docker the env is
-    injected by compose). ponytail: handles simple KEY=value only — no multiline
-    values, no ${VAR} interpolation; reach for python-dotenv if those are needed."""
+    """Load KEY=value lines from a .env file for local dev."""
     p = Path(path)
     if not p.exists():
         return
@@ -91,25 +89,18 @@ INGEST_ENABLED = (_env("INGEST_ENABLED", "true") or "").strip().lower() in (
 )
 INGEST_INTERVAL = _env_num("INGEST_INTERVAL", 30.0, float)
 INGEST_TAIL_BYTES = _env_num("INGEST_TAIL_BYTES", 2 * 1024 * 1024, int)
+RETENTION_ROWS = _env_num("RETENTION_ROWS", 500_000, int)
 
 DEFAULT_KNOWN_LOGS = "conn,dns,http,ssl,ssh,dhcp,notice,files"
 KNOWN_LOGS = [
     n.strip() for n in (_env("KNOWN_LOGS", DEFAULT_KNOWN_LOGS) or "").split(",") if n.strip()
 ]
 
-# Anchored allowlist used to build remote paths, so anything outside this
-# pattern (slashes, dots, wildcards) must never reach the filesystem layer.
 LOG_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,63}$")
 
-# Zeek field names go straight into DDL via quoted identifiers. The values we
-# see in real logs are letters, digits, underscores, and dots (e.g. id.orig_h).
-# Anything outside this regex is dropped before we touch SQL: defense in depth
-# against a malicious or corrupted #fields header.
 FIELD_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.]{0,63}$")
 
-# Fields whose Zeek type is `set[...]` or `vector[...]`. Parsing the `#types`
-# header would be more correct, but Zeek emits a stable set of these names, and
-# this list is faster and lets the operator override via env if needed.
+# Fields whose Zeek type is set[...] or vector[...].
 DEFAULT_SET_FIELDS = (
     "answers,TTLs,msg_types,tunnel_parents,uids,cert_chain_fps,"
     "client_cert_chain_fps,proxied,orig_fuids,resp_fuids,orig_filenames,"
@@ -122,19 +113,22 @@ SET_FIELDS = frozenset(
 
 
 logger = logging.getLogger("zeek_peek")
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+if not logger.handlers:
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    logger.addHandler(_handler)
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
 
 
 class SSHError(Exception):
     """Raised when an SSH operation fails. Message is safe to surface."""
 
 
-# One persistent SSH/SFTP connection is reused across requests. Reconnecting
-# per request would dominate latency on a low-end firewall like the Netgate
-# 1100. The lock serialises access to the single shared SFTP client.
 _ssh_lock = threading.Lock()
 _ssh_client: paramiko.SSHClient | None = None
 _sftp_client: paramiko.SFTPClient | None = None
+_conn_fail_until = 0.0
 
 
 def _build_client() -> paramiko.SSHClient:
@@ -144,11 +138,15 @@ def _build_client() -> paramiko.SSHClient:
         raise SSHError("SSH_HOST and SSH_USER must be set")
     client = paramiko.SSHClient()
 
-    # Host key handling. Default is strict against a known_hosts file.
+    # Host key handling.
     if SSH_KNOWN_HOSTS:
         kh_path = Path(SSH_KNOWN_HOSTS)
-        if kh_path.exists():
-            client.load_host_keys(str(kh_path))
+        if not kh_path.exists():
+            raise SSHError(
+                f"SSH_KNOWN_HOSTS={SSH_KNOWN_HOSTS} does not exist; "
+                "run `ssh-keyscan -H <host>` to create it."
+            )
+        client.load_host_keys(str(kh_path))
     else:
         with suppress(OSError):
             client.load_system_host_keys()
@@ -159,9 +157,6 @@ def _build_client() -> paramiko.SSHClient:
     if SSH_KEY_PATH:
         key_path = Path(SSH_KEY_PATH)
         if key_path.exists():
-            # An encrypted key makes *every* loader raise PasswordRequiredException
-            # (OpenSSH wraps the whole file, so the real key type isn't visible until
-            # it's decrypted), so we must try them all rather than bail on the first.
             pw_required = False
             for loader in (paramiko.Ed25519Key, paramiko.ECDSAKey, paramiko.RSAKey):
                 try:
@@ -203,15 +198,24 @@ def _build_client() -> paramiko.SSHClient:
 
 def _get_clients() -> tuple[paramiko.SSHClient, paramiko.SFTPClient]:
     """Return (ssh, sftp), reusing existing clients when alive. Caller holds _ssh_lock."""
-    global _ssh_client, _sftp_client
+    global _ssh_client, _sftp_client, _conn_fail_until
     if _ssh_client is not None:
         transport = _ssh_client.get_transport()
         if transport is not None and transport.is_active() and _sftp_client is not None:
             return _ssh_client, _sftp_client
         _close_clients()
 
-    ssh = _build_client()
-    sftp = ssh.open_sftp()
+    # Fail fast for a short window after a failed connect (a dead host would
+    # otherwise make every request wait out the full connect timeout under the lock).
+    if time.time() < _conn_fail_until:
+        raise SSHError("SSH host recently unreachable; backing off")
+    try:
+        ssh = _build_client()
+        sftp = ssh.open_sftp()
+    except Exception:
+        _conn_fail_until = time.time() + min(SSH_CONNECT_TIMEOUT, 5)
+        raise
+    _conn_fail_until = 0.0
     _ssh_client = ssh
     _sftp_client = sftp
     return ssh, sftp
@@ -252,11 +256,7 @@ def ssh_list_logs() -> list[str]:
 def ssh_fetch_log_blob(log_name: str, tail_bytes: int) -> tuple[str, str, int]:
     """Return (header_text, body_text, file_size) for a Zeek log via SFTP only.
 
-    Reads only the last `tail_bytes` of the file when it grows past that. Zeek
-    `conn.log` and `dns.log` reach megabytes within an hour and we never need
-    the full history for the dashboard view. SFTP is used instead of running
-    `tail` over an exec channel so there is no shell on the remote host and no
-    quoting/injection concerns.
+    Reads only the last `tail_bytes` when the file grows past that.
     """
     remote_path = _safe_remote_path(log_name)
     tail_bytes = max(1, min(tail_bytes, MAX_TAIL_BYTES))
@@ -304,9 +304,7 @@ def ssh_fetch_log_blob(log_name: str, tail_bytes: int) -> tuple[str, str, int]:
 def ssh_fetch_log_delta(log_name: str, from_offset: int) -> tuple[str, str, int]:
     """Return (header_text, body_text, file_size) reading bytes [from_offset, size).
 
-    Used by the ingest worker. If the file shrank since `from_offset` (log
-    rotation), reads from byte 0. Unlike tail reads, deltas start at a known
-    previous file size, so the first byte is already the first unseen byte.
+    If the file shrank since `from_offset` (log rotation), reads from byte 0.
     """
     remote_path = _safe_remote_path(log_name)
     with _ssh_lock:
@@ -331,9 +329,7 @@ def ssh_fetch_log_delta(log_name: str, from_offset: int) -> tuple[str, str, int]
                     fh.seek(0)
                     body_bytes = fh.read(size)
                 else:
-                    # `start` is normally a previous file size, on a line boundary.
-                    # If Zeek was mid-write then, the byte before `start` isn't a
-                    # newline; drop that partial (and possibly UTF-8-split) row.
+                    # Drop a partial leading row if `start` isn't on a line boundary.
                     fh.seek(start - 1)
                     previous_byte = fh.read(1)
                     fh.seek(start)
@@ -396,8 +392,7 @@ def parse_zeek(header_text: str, body_text: str) -> tuple[list[str], list[dict[s
             if raw == unset:
                 row[name] = None
             elif name in SET_FIELDS:
-                # An empty set/vector is the empty-field token (or a bare ""), not
-                # unset; keep the list type rather than collapsing it to a string.
+                # Empty set/vector stays a list, not a string.
                 row[name] = [] if raw in (empty, "") else raw.split(set_sep)
             elif raw == empty:
                 row[name] = ""
@@ -412,8 +407,7 @@ def parse_zeek(header_text: str, body_text: str) -> tuple[list[str], list[dict[s
 
 
 def _parse_open(header_text: str) -> str | None:
-    """Return the Zeek `#open` header value, used as a per-file fingerprint:
-    after a rotation the fresh `<name>.log` carries a new `#open` timestamp."""
+    """Return the Zeek `#open` header value (a per-file fingerprint)."""
     for line in header_text.splitlines():
         if line.startswith("#open"):
             parts = line.split("\t")
@@ -425,12 +419,8 @@ def _parse_open(header_text: str) -> str | None:
 # ---------- caching ----------
 
 
-# With auto-refresh on, the frontend hits `/api/status` and `/api/log/*` every
-# few seconds. Without caching this would mean an SFTP round-trip per click;
-# with a small TTL the firewall is barely touched while the UI still feels live.
 class _TTLCache:
-    """Tiny thread-safe TTL cache. The key space is bounded by the number of
-    log names (one per log), so no size cap is needed."""
+    """Tiny thread-safe TTL cache."""
 
     def __init__(self, ttl: float) -> None:
         self._ttl = ttl
@@ -462,8 +452,6 @@ _status_cache = _TTLCache(STATUS_CACHE_TTL)
 _log_cache = _TTLCache(LOG_CACHE_TTL)
 
 
-# DuckDB is embedded; one process holds the connection. We serialise access
-# with a lock that the ingest worker and the API both go through.
 _db_lock = threading.Lock()
 _db: duckdb.DuckDBPyConnection | None = None
 _ingest_task: asyncio.Task[None] | None = None
@@ -472,7 +460,6 @@ _ingest_task: asyncio.Task[None] | None = None
 def _table_name(log_name: str) -> str:
     if not LOG_NAME_RE.match(log_name):
         raise ValueError(f"Invalid log name: {log_name!r}")
-    # log_<name> avoids collisions with reserved words and the metadata table.
     return f"log_{log_name}"
 
 
@@ -483,10 +470,7 @@ def _quote_ident(name: str) -> str:
 
 
 def _get_db() -> duckdb.DuckDBPyConnection:
-    """Open the DuckDB connection, creating the metadata table on first use.
-
-    Lazy init runs under `_db_lock` so concurrent first-callers don't race.
-    """
+    """Open the DuckDB connection, creating the metadata table on first use."""
     global _db
     if _db is not None:
         return _db
@@ -523,11 +507,7 @@ def _close_db() -> None:
 
 
 def _safe_fields(fields: list[str]) -> list[str]:
-    """Drop field names that don't match the strict allowlist, and dedupe them.
-
-    Duplicates (from a corrupt/custom `#fields` header) would otherwise make
-    CREATE TABLE / ADD COLUMN raise on the repeated column and stall ingest.
-    """
+    """Drop field names that don't match the strict allowlist, and dedupe them."""
     seen: set[str] = set()
     out: list[str] = []
     for f in fields:
@@ -540,8 +520,7 @@ def _safe_fields(fields: list[str]) -> list[str]:
 def _ensure_table(con: duckdb.DuckDBPyConnection, log_name: str, fields: list[str]) -> None:
     """Create or extend the per-log table to cover every Zeek field name.
 
-    All columns are VARCHAR except `ts` (DOUBLE). Set/vector fields are stored
-    as JSON strings to keep the schema flat and avoid per-log type discovery.
+    All columns are VARCHAR except `ts` (DOUBLE); set/vector fields are JSON strings.
     """
     table = _table_name(log_name)
     quoted_table = _quote_ident(table)
@@ -595,22 +574,19 @@ def db_ingest_one(log_name: str) -> int:
     prior_open = prior[1] if prior else None
 
     if last_size == 0:
-        # First run: only ingest the recent tail to avoid hammering the firewall.
+        # First run: only ingest the recent tail.
         header, body, size = ssh_fetch_log_blob(log_name, INGEST_TAIL_BYTES)
         from_offset = max(0, size - INGEST_TAIL_BYTES)
     else:
         header, body, size = ssh_fetch_log_delta(log_name, last_size)
         from_offset = last_size if size >= last_size else 0
-        # Detect rotation by file identity, not just size: a fresh post-rotation
-        # file can already have grown past last_size between polls (size-only
-        # detection would then read mid-file and silently lose the leading rows).
-        # The `#open` header differs per file, so a change means a new file.
-        cur_open = _parse_open(header)
+        # Detect rotation by #open change, not just size shrink.
+        delta_open = _parse_open(header)
         rotated = size < last_size or (
-            prior_open is not None and cur_open is not None and cur_open != prior_open
+            prior_open is not None and delta_open is not None and delta_open != prior_open
         )
         if rotated and from_offset > 0:
-            # We read the delta from the wrong offset; re-read the whole new file.
+            # Re-read the whole new file from byte 0.
             header, body, size = ssh_fetch_log_delta(log_name, 0)
             from_offset = 0
 
@@ -623,9 +599,6 @@ def db_ingest_one(log_name: str) -> int:
     if not fields:
         return 0
 
-    # No cross-file dedup: a rotated read starts at byte 0 of a *different* file,
-    # whose rows were never stored, and the normal delta reads only unseen bytes.
-
     inserted = 0
     with _db_lock:
         _ensure_table(con, log_name, fields)
@@ -636,6 +609,14 @@ def db_ingest_one(log_name: str) -> int:
             insert_sql = f"INSERT INTO {_quote_ident(_table_name(log_name))} ({cols}) VALUES ({placeholders})"  # nosec B608
             con.executemany(insert_sql, params)
             inserted = len(rows)
+            # Cap rows per table so the DB file stabilises instead of growing forever.
+            if RETENTION_ROWS > 0:
+                qt = _quote_ident(_table_name(log_name))
+                con.execute(  # nosec B608
+                    f"DELETE FROM {qt} WHERE rowid NOT IN "
+                    f"(SELECT rowid FROM {qt} ORDER BY ts DESC NULLS LAST, rowid DESC LIMIT ?)",
+                    [RETENTION_ROWS],
+                )
 
         latest_ts = max(
             (r["ts"] for r in rows if isinstance(r.get("ts"), int | float)),
@@ -692,9 +673,6 @@ def db_query_log(log_name: str, limit: int) -> tuple[list[str], list[dict[str, A
         ]
         if not cols:
             return None
-        # NULLS LAST: rows with an unset ts are the least "recent" and get dropped
-        # first by LIMIT. rowid DESC is a stable tiebreaker so equal-ts rows keep
-        # insertion order across refreshes.
         sql = f"SELECT * FROM {quoted_table} ORDER BY ts DESC NULLS LAST, rowid DESC LIMIT ?"  # nosec B608
         raw = con.execute(sql, [limit]).fetchall()
 
@@ -757,8 +735,7 @@ async def _ingest_loop(stop: asyncio.Event) -> None:
                 logger.warning("ingest %s: ssh error: %s", name, exc)
             except Exception:
                 logger.exception("ingest %s: unexpected error", name)
-        # Interruptible sleep: wake immediately on shutdown instead of cancelling
-        # mid-ingest (which would orphan the worker thread onto a closed connection).
+        # Interruptible sleep: wake immediately on shutdown.
         with suppress(TimeoutError):
             await asyncio.wait_for(stop.wait(), timeout=INGEST_INTERVAL)
 
@@ -766,14 +743,20 @@ async def _ingest_loop(stop: asyncio.Event) -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _ingest_task
+    bind_host = _env("HOST", "127.0.0.1")
+    if bind_host not in ("127.0.0.1", "localhost", "::1"):
+        logger.warning(
+            "Bound to %s with no authentication; put zeek-peek behind a reverse "
+            "proxy or restrict at the network layer.",
+            bind_host,
+        )
     stop = asyncio.Event()
     if INGEST_ENABLED and DB_PATH:
         _ingest_task = asyncio.create_task(_ingest_loop(stop))
     yield
     stop.set()
     if _ingest_task is not None:
-        # Wait for the in-flight ingest to finish before tearing down connections,
-        # so a running worker thread never touches a closed DuckDB/SSH client.
+        # Wait for the in-flight ingest to finish before closing connections.
         with suppress(Exception):
             await _ingest_task
     with _ssh_lock:
@@ -801,8 +784,6 @@ async def _security_headers(  # pyright: ignore[reportUnusedFunction]
     response.headers.setdefault("X-Content-Type-Options", "nosniff")
     response.headers.setdefault("X-Frame-Options", "DENY")
     response.headers.setdefault("Referrer-Policy", "no-referrer")
-    # The dashboard is self-contained (inline script/style need 'unsafe-inline'),
-    # but locking down object/frame/base still blunts any future injection.
     response.headers.setdefault(
         "Content-Security-Policy",
         "default-src 'self'; script-src 'self' 'unsafe-inline'; "
@@ -843,8 +824,7 @@ async def api_status() -> JSONResponse:
         logger.exception("Unexpected error in /api/status")
         info.update(ok=False, error=f"Unexpected error: {exc.__class__.__name__}")
 
-    # Cache failures only briefly so the dashboard recovers quickly once SSH is
-    # back, while still rate-limiting probes against a host that's actually down.
+    # Cache failures only briefly.
     _status_cache.set("status", info, ttl=None if info["ok"] else min(STATUS_CACHE_TTL, 1.0))
     return JSONResponse(info)
 
@@ -857,8 +837,7 @@ async def api_log(
     if not LOG_NAME_RE.match(name):
         raise HTTPException(400, "Invalid log name")
 
-    # Serve from DuckDB when storage is enabled; fall back to SFTP only on a cold
-    # start (table missing or still empty).
+    # Serve from DuckDB when enabled; fall back to SFTP on cold start.
     if DB_PATH:
         try:
             db_result = await asyncio.to_thread(db_query_log, name, limit)

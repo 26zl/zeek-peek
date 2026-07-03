@@ -110,8 +110,7 @@ def test_status_error_when_ssh_fails(client, monkeypatch):
 
 
 def test_log_db_error_falls_back_to_ssh(client, monkeypatch):
-    # Storage enabled, but the DB query blows up: the endpoint must fall back to
-    # SFTP rather than 500.
+    # DB query blows up -> endpoint must fall back to SFTP, not 500.
     monkeypatch.setattr(main, "DB_PATH", "/tmp/zeek-peek-test.duckdb")
 
     def boom(name, limit):
