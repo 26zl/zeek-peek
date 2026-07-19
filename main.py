@@ -715,8 +715,9 @@ def _db_status() -> dict[str, Any]:
         info["state"] = [
             {"log": r[0], "file_size": r[1], "last_ts": r[2], "updated_at": str(r[3])} for r in rows
         ]
-    except Exception as exc:
-        info["error"] = str(exc)
+    except Exception:
+        logger.exception("Failed to collect DB status")
+        info["error"] = "Database status unavailable"
     return info
 
 
