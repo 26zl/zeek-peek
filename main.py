@@ -18,6 +18,7 @@ import duckdb
 import paramiko
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response
 
 
@@ -79,6 +80,12 @@ STATUS_CACHE_TTL = _env_num("STATUS_CACHE_TTL", 5.0, float)
 LOG_CACHE_TTL = _env_num("LOG_CACHE_TTL", 2.0, float)
 
 ALLOWED_ORIGINS = [o.strip() for o in (_env("ALLOWED_ORIGINS", "") or "").split(",") if o.strip()]
+
+# Host-header allowlist for the TrustedHost middleware (DNS-rebinding guard).
+# Defaults to loopback; set a real hostname (or "*") for reverse-proxy setups.
+ALLOWED_HOSTS = [
+    h.strip() for h in (_env("ALLOWED_HOSTS", "127.0.0.1,localhost") or "").split(",") if h.strip()
+] or ["127.0.0.1", "localhost"]
 
 DB_PATH = _env("DB_PATH", "") or ""
 INGEST_ENABLED = (_env("INGEST_ENABLED", "true") or "").strip().lower() in (
@@ -766,6 +773,10 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="zeek-peek", lifespan=lifespan)
+
+# Reject requests whose Host header is not in the allowlist so a malicious page
+# cannot rebind its domain to this loopback service and read /api/log/*.
+app.add_middleware(TrustedHostMiddleware, allowed_hosts=ALLOWED_HOSTS)
 
 if ALLOWED_ORIGINS:
     app.add_middleware(

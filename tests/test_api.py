@@ -42,7 +42,7 @@ def client(monkeypatch):
     monkeypatch.setattr(main, "ssh_fetch_log_blob", lambda name, tail: (HEADER, BODY, len(BODY)))
     main._status_cache._data.clear()
     main._log_cache._data.clear()
-    return TestClient(main.app)
+    return TestClient(main.app, base_url="http://localhost")
 
 
 def test_status(client):

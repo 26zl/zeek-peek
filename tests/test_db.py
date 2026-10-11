@@ -228,7 +228,7 @@ def test_lifespan_starts_and_cleanly_stops_ingest(db_main, monkeypatch):
     monkeypatch.setattr(db_main, "db_ingest_one", lambda n: ran.append(n))
 
     # Entering/exiting the context runs lifespan startup and shutdown.
-    with TestClient(db_main.app):
+    with TestClient(db_main.app, base_url="http://localhost"):
         deadline = 50
         while not ran and deadline:
             time.sleep(0.01)

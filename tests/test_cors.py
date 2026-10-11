@@ -22,7 +22,7 @@ def test_cors_echoes_configured_origin(monkeypatch):
         import main as m
 
         monkeypatch.setattr(m, "ssh_list_logs", lambda: [])
-        client = TestClient(m.app)
+        client = TestClient(m.app, base_url="http://localhost")
         r = client.get("/api/health", headers={"Origin": "http://dash.example"})
         assert r.headers.get("access-control-allow-origin") == "http://dash.example"
     finally:
