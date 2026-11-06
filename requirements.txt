@@ -1,4 +1,4 @@
 fastapi==0.153.0
 uvicorn[standard]==0.54.0
 paramiko==5.1.0
-duckdb==1.5.6
+duckdb==2.0.0
